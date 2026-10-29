@@ -766,6 +766,9 @@ stateful_unmount() {
 	run_quiet umount -A "$ST_PART" || :
 
 	stateful_is_mounted && return 1
+	# Everything that was running is gone now, networking included. The
+	# installer needs to know, because its next step wants the network.
+	GLACIER_SESSION_DOWN=1
 	return 0
 }
 
@@ -1026,6 +1029,9 @@ TXT
 		summary
 		printf '\n'
 		say 'Reboot when you are ready. ChromeOS will come back up as normal.'
+		printf '\n'
+		say 'Note: this session has no network any more -- it was shut down to'
+		say 'unmount stateful. Reboot before running "glacier install".'
 	else
 		oops 'The resize did not complete. The log has details:'
 		say "  $GLACIER_LOG"
@@ -1191,6 +1197,7 @@ resize_main() {
 DEVKEYS=${DEVKEYS:-/usr/share/vboot/devkeys}
 ALPINE_MIRROR=${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}
 ALPINE_BRANCH=${ALPINE_BRANCH:-latest-stable}
+ROOTFS_TARBALL=${ROOTFS_TARBALL:-}
 GLACIER_LOCAL=${GLACIER_LOCAL:-/usr/local}
 NO_PERSIST=${NO_PERSIST:-0}
 # Overridable so the test harness can exercise both verification states and
@@ -1216,6 +1223,9 @@ Options:
   --kern-size MiB   Size of Glacier's kernel partition (default $KERNC_MIB).
   --uninstall       Put KERN-C/ROOT-C back and hand booting to ChromeOS.
   --no-persist      Never touch ROOT-A, even if verification is already off.
+  --rootfs FILE     Use a local Alpine minirootfs tarball instead of
+                    downloading one. Lets the install run with no network.
+  --mirror URL      Alpine mirror to fetch from.
   --dry-run         Print every disk-modifying command without running it.
   --debug           Echo subcommand output.
   -h, --help        This text.
@@ -1341,23 +1351,126 @@ alpine_arch() {
 	esac
 }
 
+# Why the network might be gone, and what to do about it. Worth spelling out:
+# the natural order of operations (resize, then install) is exactly what
+# breaks it, and the failure gives no hint of that on its own.
+net_hint() {
+	printf '\n'
+	warn 'Glacier needs the network to fetch its base root filesystem.'
+	cat <<'TXT'
+
+  If you resized the stateful partition in THIS session, that shut the
+  ChromeOS session down to unmount it -- and the network went down with it.
+  Nothing is wrong: reboot, then run the installer again.
+
+      reboot
+
+  Otherwise, check the connection, or fetch the image on another machine and
+  hand it over directly:
+
+      glacier install --rootfs alpine-minirootfs-<version>-<arch>.tar.gz
+
+  A different mirror also works:
+
+      glacier install --mirror https://mirror.example.org/alpine
+
+TXT
+}
+
+# Sanity-check whatever we ended up with before trusting it as a root
+# filesystem. A captive portal returning an HTML error page is a tarball-
+# shaped failure that would otherwise surface much later and far less clearly.
+check_tarball() {
+	local f=$1
+	[ -s "$f" ] || { oops 'The downloaded image is empty.'; return 1; }
+	if ! tar -tzf "$f" >/dev/null 2>&1; then
+		oops 'The downloaded image is not a valid gzip tarball.'
+		say "  (got $(fmt_size "$(stat -c%s "$f" 2>/dev/null || echo 0)") -- a captive"
+		say '   portal or proxy may have returned an error page instead)'
+		return 1
+	fi
+	return 0
+}
+
 fetch_rootfs() {
-	local arch base file
-	arch=$(alpine_arch) || { oops "Unsupported architecture $(uname -m)"; return 1; }
+	local arch base yaml file sha out
+
+	# A local tarball skips the network altogether.
+	if [ -n "$ROOTFS_TARBALL" ]; then
+		[ -r "$ROOTFS_TARBALL" ] || {
+			oops "Cannot read $ROOTFS_TARBALL"
+			return 1
+		}
+		info "Using the local base image $ROOTFS_TARBALL"
+		cp -f "$ROOTFS_TARBALL" "$WORKDIR/rootfs.tar.gz" || return 1
+		check_tarball "$WORKDIR/rootfs.tar.gz" || return 1
+		good "Base image OK ($(fmt_size "$(stat -c%s "$WORKDIR/rootfs.tar.gz")"))"
+		return 0
+	fi
+
+	arch=$(alpine_arch) || {
+		oops "Unsupported architecture $(uname -m)"
+		return 1
+	}
 	base="$ALPINE_MIRROR/$ALPINE_BRANCH/releases/$arch"
 
 	info "Fetching the Alpine $arch base image..."
-	file=$(curl -sL "$base/latest-releases.yaml" 2>/dev/null |
-		awk '/minirootfs/ {f=1} f && /file:/ {print $2; exit}')
-	if [ -z "$file" ]; then
-		file=$(curl -sL "$base/" 2>/dev/null |
-			grep -o "alpine-minirootfs-[0-9.]*-$arch\.tar\.gz" | sort -V | tail -1)
-	fi
-	[ -n "$file" ] || { oops 'Could not work out the Alpine image filename.'; return 1; }
 
-	curl -fsSL -o "$WORKDIR/rootfs.tar.gz" "$base/$file" ||
-		{ oops "Download failed: $base/$file"; return 1; }
-	good "Got $file ($(fmt_size "$(stat -c%s "$WORKDIR/rootfs.tar.gz")"))"
+	# Deliberately not -s: when this fails, the reason is the whole point.
+	if ! yaml=$(curl -fsSL --connect-timeout 15 --max-time 120 \
+		"$base/latest-releases.yaml" 2>"$WORKDIR/curl.err"); then
+		oops "Could not reach $base"
+		sed 's/^/      /' "$WORKDIR/curl.err" >&2
+		net_hint
+		return 1
+	fi
+
+	# The minirootfs entry names its flavor before its file, so anchor on the
+	# flavor line rather than on any line that happens to say "minirootfs".
+	file=$(printf '%s\n' "$yaml" |
+		awk '/flavor:[[:space:]]*alpine-minirootfs/ {f=1; next}
+		     f && /file:/ {print $2; exit}')
+	sha=$(printf '%s\n' "$yaml" |
+		awk '/flavor:[[:space:]]*alpine-minirootfs/ {f=1; next}
+		     f && /sha256:/ {print $2; exit}')
+
+	# Fall back to reading the directory index.
+	if [ -z "$file" ]; then
+		sha=''
+		file=$(curl -fsSL --connect-timeout 15 --max-time 120 "$base/" 2>/dev/null |
+			grep -o "alpine-minirootfs-[0-9.]*-$arch\.tar\.gz" |
+			sort -V 2>/dev/null | tail -1)
+		[ -z "$file" ] && file=$(curl -fsSL "$base/" 2>/dev/null |
+			grep -o "alpine-minirootfs-[0-9.]*-$arch\.tar\.gz" | sort | tail -1)
+	fi
+
+	if [ -z "$file" ]; then
+		oops "Reached $base but could not find a minirootfs image for $arch."
+		say '  The mirror layout may have changed. Pass one directly:'
+		say '      glacier install --rootfs <tarball>'
+		return 1
+	fi
+
+	if ! out=$(curl -fSL --connect-timeout 15 --max-time 600 \
+		-o "$WORKDIR/rootfs.tar.gz" "$base/$file" 2>&1); then
+		oops "Download failed: $base/$file"
+		printf '%s\n' "$out" | sed 's/^/      /' >&2
+		net_hint
+		return 1
+	fi
+
+	check_tarball "$WORKDIR/rootfs.tar.gz" || return 1
+
+	if [ -n "$sha" ] && have sha256sum; then
+		if [ "$(sha256sum "$WORKDIR/rootfs.tar.gz" | awk '{print $1}')" = "$sha" ]; then
+			good "Got $file ($(fmt_size "$(stat -c%s "$WORKDIR/rootfs.tar.gz")")), checksum OK"
+		else
+			oops 'Checksum mismatch on the downloaded image. Refusing to use it.'
+			return 1
+		fi
+	else
+		good "Got $file ($(fmt_size "$(stat -c%s "$WORKDIR/rootfs.tar.gz")"))"
+	fi
 	return 0
 }
 
@@ -1383,29 +1496,39 @@ build_rootfs() {
 	mount --bind /dev "$MNT/dev" 2>/dev/null || :
 
 	info 'Adding the tools Glacier needs...'
-	# sgdisk is how Glacier edits the GPT boot attributes. cgpt would be the
-	# natural choice, but it is a glibc ChromeOS binary and this rootfs is
-	# musl, so it cannot run here. Install it on its own: apk fails a whole
-	# transaction if any single name is wrong, and losing sgdisk because an
-	# optional extra went missing would leave the menu unable to boot ChromeOS.
-	if ! chroot "$MNT" /sbin/apk add --no-cache --quiet sgdisk \
-		>>"$GLACIER_LOG" 2>&1; then
-		warn 'Could not install sgdisk (offline?).'
+
+	# First choice: ChromeOS's own cgpt, copied off this machine. It needs no
+	# network, and it is the same tool ChromeOS uses to pick a boot kernel.
+	GPT_TOOL_OK=0
+	if install_cros_cgpt; then
+		good 'cgpt copied from ChromeOS -- the menu can switch the boot order.'
+		GPT_TOOL_OK=1
 	fi
-	# Nice to have; a failure here must not take sgdisk down with it.
+
+	# Second choice: sgdisk from Alpine, which does need the network.
+	if [ "$GPT_TOOL_OK" = 0 ]; then
+		chroot "$MNT" /sbin/apk add --no-cache --quiet sgdisk \
+			>>"$GLACIER_LOG" 2>&1 || :
+		if chroot "$MNT" /bin/sh -c 'command -v sgdisk' >/dev/null 2>&1; then
+			good 'sgdisk installed -- the menu can switch the boot order.'
+			GPT_TOOL_OK=1
+		fi
+	fi
+
+	# Nice to have. A failure here must not take anything else down with it;
+	# apk fails a whole transaction if any single name is wrong.
 	chroot "$MNT" /sbin/apk add --no-cache --quiet \
 		e2fsprogs e2fsprogs-extra lvm2 util-linux blkid \
 		>>"$GLACIER_LOG" 2>&1 ||
-		warn 'Some optional tools could not be installed; the menu still works.'
+		warn 'Optional tools could not be installed; the menu still works.'
 
-	# sgdisk is how the menu hands the machine back to ChromeOS. If it is
-	# missing, Glacier boots but is a one-way trip -- so say so now.
-	if [ "$GLACIER_DRY_RUN" != 1 ] && ! chroot "$MNT" /bin/sh -c 'command -v sgdisk' >/dev/null 2>&1; then
-		warn 'sgdisk is not present in the Glacier root filesystem.'
-		warn 'The menu will boot, but "Boot ChromeOS" cannot change the boot order.'
-		warn 'Re-run with a working network connection to fix this.'
-	else
-		good 'sgdisk present -- the menu can switch the boot order.'
+	# Without one of the two, Glacier boots but cannot hand the machine back.
+	# That is a trap, so be loud about it.
+	if [ "$GLACIER_DRY_RUN" != 1 ] && [ "$GPT_TOOL_OK" = 0 ]; then
+		warn 'Neither cgpt nor sgdisk is present in the Glacier root filesystem.'
+		warn 'Glacier would boot, but "Boot ChromeOS" could not change the boot'
+		warn 'order -- you would have to recover from a USB stick.'
+		ui_confirm 'Install anyway?' || return 1
 	fi
 
 	install_payload || return 1
@@ -1416,6 +1539,57 @@ build_rootfs() {
 	run umount "$MNT" || :
 	MNT=''
 	return 0
+}
+
+# Carry ChromeOS's own cgpt into Glacier.
+#
+# Glacier's userland is musl and cgpt is a glibc binary, so it cannot use the
+# system loader. Copying the loader and its libraries alongside, and invoking
+# the binary through that loader, sidesteps the mismatch entirely.
+#
+# This is what lets the menu change the boot order with no network: sgdisk
+# would otherwise have to come from apk. It is also the more faithful option,
+# since cgpt is exactly what ChromeOS itself uses.
+install_cros_cgpt() {
+	local src loader libs lib base
+	src=$(command -v cgpt) || return 1
+	[ -n "$src" ] && [ -r "$src" ] || return 1
+
+	mkdir -p "$MNT/opt/cros/bin" "$MNT/opt/cros/lib" || return 1
+	cp -f "$src" "$MNT/opt/cros/cgpt.bin" || return 1
+	chmod 0755 "$MNT/opt/cros/cgpt.bin"
+
+	# Shared libraries it links against, plus the dynamic loader itself. The
+	# loader is the ldd line with no "=>" arrow.
+	libs=$(ldd "$src" 2>/dev/null | awk '/=>/ {print $3}' | grep '^/' || :)
+	loader=$(ldd "$src" 2>/dev/null |
+		awk '!/=>/ && $1 ~ /^\// {print $1; exit}')
+
+	for lib in $libs; do
+		[ -r "$lib" ] && cp -fL "$lib" "$MNT/opt/cros/lib/" 2>/dev/null || :
+	done
+	if [ -n "$loader" ] && [ -r "$loader" ]; then
+		cp -fL "$loader" "$MNT/opt/cros/lib/" 2>/dev/null || :
+		base=$(basename "$loader")
+	else
+		warn 'Could not find the dynamic loader for cgpt.'
+		return 1
+	fi
+
+	cat >"$MNT/opt/cros/bin/cgpt" <<WRAP
+#!/bin/sh
+# cgpt from ChromeOS, run through its own glibc loader so it works in a musl
+# root filesystem. Installed by glacier-install.
+exec /opt/cros/lib/$base --library-path /opt/cros/lib /opt/cros/cgpt.bin "\$@"
+WRAP
+	chmod 0755 "$MNT/opt/cros/bin/cgpt"
+
+	# Prove it actually runs here rather than discovering it at boot.
+	if chroot "$MNT" /opt/cros/bin/cgpt >/dev/null 2>&1 ||
+		[ "$(chroot "$MNT" /opt/cros/bin/cgpt 2>&1 | head -c 1 | wc -c)" -gt 0 ]; then
+		return 0
+	fi
+	return 1
 }
 
 install_payload() {
@@ -1754,6 +1928,8 @@ install_main() {
 			--kern-size) KERNC_MIB=$2; shift ;;
 			--uninstall) uninstall=1 ;;
 			--no-persist) NO_PERSIST=1 ;;
+			--rootfs) ROOTFS_TARBALL=$2; shift ;;
+			--mirror) ALPINE_MIRROR=$2; shift ;;
 			--dry-run) GLACIER_DRY_RUN=1 ;;
 			--debug) GLACIER_DEBUG=1 ;;
 			-h | --help) install_usage; exit 0 ;;
@@ -1785,6 +1961,19 @@ install_main() {
 	ui_clear
 	printf '%s  GLACIER%s  %sinstaller%s  %s%s%s\n\n' \
 		"$C_BOLD$C_BLU" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$GLACIER_VERSION" "$C_RESET"
+
+	# Resizing tears the ChromeOS session down to unmount stateful, and the
+	# network goes with it. Catch that here rather than ten steps later at a
+	# failed download.
+	if [ "${GLACIER_SESSION_DOWN:-0}" = 1 ] && [ -z "$ROOTFS_TARBALL" ] &&
+		[ "$uninstall" != 1 ]; then
+		warn 'The ChromeOS session was shut down earlier in this run, so there'
+		warn 'is no network. The installer needs it to fetch its base image.'
+		printf '\n  Reboot and run %sglacier install%s again.\n' "$C_BOLD" "$C_RESET"
+		printf '  Or pass a local image with %s--rootfs <tarball>%s.\n\n' "$C_BOLD" "$C_RESET"
+		ui_confirm 'Try anyway?' || exit 0
+		printf '\n'
+	fi
 
 	if [ "$uninstall" = 1 ]; then
 		do_uninstall
@@ -2024,81 +2213,101 @@ GLACIER_B64
 	base64 -d >"$d/glacier-gpt.sh" <<'GLACIER_B64'
 IyBzaGVsbGNoZWNrIHNoZWxsPXNoCiMKIyBHbGFjaWVyIDo6IHBheWxvYWQvZ2xhY2llci1ncHQu
 c2ggLS0gcmVhZCBhbmQgd3JpdGUgQ2hyb21lT1MgR1BUIGJvb3QKIyBhdHRyaWJ1dGVzIGZyb20g
-aW5zaWRlIHRoZSBHbGFjaWVyIGVudmlyb25tZW50LCB1c2luZyBzZ2Rpc2suCiMKIyBDaHJvbWVP
-UyBwYWNrcyB0aHJlZSBmaWVsZHMgaW50byB0aGUgR1BUIGF0dHJpYnV0ZSB3b3JkIG9mIGV2ZXJ5
-IGtlcm5lbAojIHBhcnRpdGlvbi4gVmVyaWZpZWQgYWdhaW5zdCBjZ3B0IG9uIGEgc2NyYXRjaCBk
-aXNrOgojCiMgICBiaXRzIDQ4LTUxICBwcmlvcml0eSAgICgwLTE1OyAwIG1lYW5zICJuZXZlciBi
-b290IHRoaXMiKQojICAgYml0cyA1Mi01NSAgdHJpZXMgICAgICAocmVtYWluaW5nIGJvb3QgYXR0
-ZW1wdHMpCiMgICBiaXQgIDU2ICAgICBzdWNjZXNzZnVsICh0aGlzIGtlcm5lbCBib290ZWQgY2xl
-YW5seSBhdCBsZWFzdCBvbmNlKQojCiMgVGhlIGZpcm13YXJlIGJvb3RzIHRoZSBrZXJuZWwgcGFy
-dGl0aW9uIHdpdGggdGhlIGhpZ2hlc3QgcHJpb3JpdHkgdGhhdCBoYXMKIyBzdWNjZXNzZnVsPTEg
-b3IgdHJpZXM+MC4gY2dwdCBpc24ndCBpbiB0aGlzIGVudmlyb25tZW50IC0tIGl0IGlzIGEgZ2xp
-YmMKIyBDaHJvbWVPUyBiaW5hcnkgYW5kIEdsYWNpZXIgaXMgbXVzbCAtLSBzbyBzZ2Rpc2sgZG9l
-cyB0aGUgd29yayBpbnN0ZWFkLgoKUFJJT19TSElGVD00OApBVFRSX1BSSU9fTUFTSz0nMHgwMDBG
-MDAwMDAwMDAwMDAwJwoKIyBBdHRyaWJ1dGUgd29yZCBvZiBhIHBhcnRpdGlvbiwgYXMgYSBwbGFp
-biBoZXggc3RyaW5nLgpncHRfYXR0cigpIHsgIyA8ZGlzaz4gPHBhcnRudW0+CglzZ2Rpc2sgLS1p
-bmZvPSIkMiIgIiQxIiAyPi9kZXYvbnVsbCB8CgkJc2VkIC1uICdzL15BdHRyaWJ1dGUgZmxhZ3M6
-ICpcKFswLTlBLUZhLWZdKlwpLiovXDEvcCcKfQoKZ3B0X2ZpZWxkKCkgeyAjIDxkaXNrPiA8cGFy
-dG51bT4gcHJpb3JpdHl8dHJpZXN8c3VjY2Vzc2Z1bAoJYXR0cj0kKGdwdF9hdHRyICIkMSIgIiQy
-IikKCVsgLW4gIiRhdHRyIiBdIHx8IHJldHVybiAxCgl2YWw9JChwcmludGYgJyVkJyAiMHgkYXR0
-ciIgMj4vZGV2L251bGwpIHx8IHJldHVybiAxCgljYXNlICIkMyIgaW4KCQlwcmlvcml0eSkgICBw
-cmludGYgJyVkJyAkKCggKHZhbCA+PiA0OCkgJiAweEYgKSkgOzsKCQl0cmllcykgICAgICBwcmlu
-dGYgJyVkJyAkKCggKHZhbCA+PiA1MikgJiAweEYgKSkgOzsKCQlzdWNjZXNzZnVsKSBwcmludGYg
-JyVkJyAkKCggKHZhbCA+PiA1NikgJiAweDEgKSkgOzsKCQkqKSByZXR1cm4gMSA7OwoJZXNhYwp9
-CgojIFJld3JpdGUgcHJpb3JpdHkgd2hpbGUgbGVhdmluZyB0cmllcyBhbmQgc3VjY2Vzc2Z1bCBh
-bG9uZS4KIwojIFRoaXMgc2V0cyBhbmQgY2xlYXJzIHRoZSBmb3VyIHByaW9yaXR5IGJpdHMgaW5k
-aXZpZHVhbGx5IHJhdGhlciB0aGFuCiMgYXNzaWduaW5nIHRoZSBhdHRyaWJ1dGUgd29yZCBpbiBv
-bmUgZ28uIHNnZGlzaydzICI9IiBhc3NpZ25tZW50IGZvcm0gaXMgbm90CiMgYWNjZXB0ZWQgYnkg
-ZXZlcnkgYnVpbGQgLS0gZ3B0ZmRpc2sgMS4wLjEwIHJlamVjdHMgaXQgd2l0aCAiQ291bGQgbm90
-CiMgY29udmVydCBoZXggYXR0cmlidXRlIG1hc2siIC0tIHdoZXJlYXMgc2V0L2NsZWFyIGlzIHVu
-ZGVyc3Rvb2QgZXZlcnl3aGVyZS4KZ3B0X3NldF9wcmlvcml0eSgpIHsgIyA8ZGlzaz4gPHBhcnRu
-dW0+IDwwLTE1PgoJX2Q9JDEKCV9wPSQyCglfdj0kMwoJX2FyZ3M9JycKCV9pPTAKCXdoaWxlIFsg
-IiRfaSIgLWx0IDQgXTsgZG8KCQlpZiBbICQoKCAoX3YgPj4gX2kpICYgMSApKSAtZXEgMSBdOyB0
-aGVuCgkJCV9hcmdzPSIkX2FyZ3MgLS1hdHRyaWJ1dGVzPSRfcDpzZXQ6JCgoNDggKyBfaSkpIgoJ
-CWVsc2UKCQkJX2FyZ3M9IiRfYXJncyAtLWF0dHJpYnV0ZXM9JF9wOmNsZWFyOiQoKDQ4ICsgX2kp
-KSIKCQlmaQoJCV9pPSQoKF9pICsgMSkpCglkb25lCgkjIHNoZWxsY2hlY2sgZGlzYWJsZT1TQzIw
-ODYKCXNnZGlzayAkX2FyZ3MgIiRfZCIgPi9kZXYvbnVsbCAyPiYxCn0KCmdwdF9tYXJrX2dvb2Qo
-KSB7ICMgPGRpc2s+IDxwYXJ0bnVtPiAtLSBzdWNjZXNzZnVsPTEsIHRyaWVzPTAKCXNnZGlzayAi
-LS1hdHRyaWJ1dGVzPSQyOnNldDo1NiIgXAoJCSItLWF0dHJpYnV0ZXM9JDI6Y2xlYXI6NTIiICIt
-LWF0dHJpYnV0ZXM9JDI6Y2xlYXI6NTMiIFwKCQkiLS1hdHRyaWJ1dGVzPSQyOmNsZWFyOjU0IiAi
-LS1hdHRyaWJ1dGVzPSQyOmNsZWFyOjU1IiBcCgkJIiQxIiA+L2Rldi9udWxsIDI+JjEKfQoKCiMg
-UGFydGl0aW9uIG51bWJlciBjYXJyeWluZyBhIEdQVCBuYW1lLCBlLmcuIEtFUk4tQS4gc2dkaXNr
-IHByaW50cyB0aGUgbmFtZSBpbgojIHRoZSBsYXN0IGNvbHVtbiBvZiBpdHMgcGFydGl0aW9uIGxp
-c3RpbmcuCmdwdF9udW1fYnlfbGFiZWwoKSB7ICMgPGRpc2s+IDxsYWJlbD4KCXNnZGlzayAtcCAi
-JDEiIDI+L2Rldi9udWxsIHwgYXdrIC12IHdhbnQ9IiQyIiAnCgkJL15bIF0qWzAtOV0rLyB7CgkJ
-CW5hbWUgPSAiIgoJCQlmb3IgKGkgPSA3OyBpIDw9IE5GOyBpKyspIG5hbWUgPSBuYW1lIChuYW1l
-ID8gIiAiIDogIiIpICRpCgkJCWlmIChuYW1lID09IHdhbnQpIHsgcHJpbnQgJDE7IGV4aXQgfQoJ
-CX0nCn0KCmdwdF9wYXJ0dXVpZCgpIHsgIyA8ZGlzaz4gPHBhcnRudW0+CglzZ2Rpc2sgLS1pbmZv
-PSIkMiIgIiQxIiAyPi9kZXYvbnVsbCB8CgkJc2VkIC1uICdzL15QYXJ0aXRpb24gdW5pcXVlIEdV
-SUQ6ICovL3AnCn0KCiMgL2Rldi9zZGEgKyAzIC0+IC9kZXYvc2RhMzsgL2Rldi9tbWNibGswICsg
-MyAtPiAvZGV2L21tY2JsazBwMy4KZ3B0X3BhcnRfZGV2KCkgeyAjIDxkaXNrPiA8cGFydG51bT4K
-CWNhc2UgIiQxIiBpbgoJCSpbMC05XSkgcHJpbnRmICclc3AlcycgIiQxIiAiJDIiIDs7CgkJKikg
-cHJpbnRmICclcyVzJyAiJDEiICIkMiIgOzsKCWVzYWMKfQoKIyBGaW5kIHRoZSBpbnRlcm5hbCBD
-aHJvbWVPUyBkaXNrIGFnYWluIGF0IHJ1bnRpbWUgcmF0aGVyIHRoYW4gdHJ1c3RpbmcgYQojIGRl
-dmljZSBuYW1lIHJlY29yZGVkIGF0IGluc3RhbGwgdGltZS4KZ3B0X2ZpbmRfY3Jvc19kaXNrKCkg
-ewoJZm9yIGQgaW4gL2Rldi9tbWNibGtbMC05XSAvZGV2L252bWVbMC05XW5bMC05XSAvZGV2L3Nk
-W2Etel07IGRvCgkJWyAtYiAiJGQiIF0gfHwgY29udGludWUKCQljYXNlICIkZCIgaW4gKmJvb3Rb
-MC05XSB8ICpycG1iKSBjb250aW51ZSA7OyBlc2FjCgkJbGlzdGluZz0kKHNnZGlzayAtcCAiJGQi
-IDI+L2Rldi9udWxsKSB8fCBjb250aW51ZQoJCWNhc2UgIiRsaXN0aW5nIiBpbgoJCQkqS0VSTi1B
-KikgY2FzZSAiJGxpc3RpbmciIGluICpST09ULUEqKSBwcmludGYgJyVzJyAiJGQiOyByZXR1cm4g
-MCA7OyBlc2FjIDs7CgkJZXNhYwoJZG9uZQoJcmV0dXJuIDEKfQoKIyBJcyBDaHJvbWVPUyBzdGls
-bCBzZXQgdXAgdG8gdmVyaWZ5IGl0cyByb290IGZpbGVzeXN0ZW0/CiMKIyBHbGFjaWVyIGNhbm5v
-dCByZWFkIC9wcm9jL2NtZGxpbmUgZm9yIHRoaXMgLS0gdGhhdCBpcyBHbGFjaWVyJ3Mgb3duIGNv
-bW1hbmQKIyBsaW5lLCBub3QgQ2hyb21lT1Mncy4gVGhlIGF1dGhvcml0eSBpcyB0aGUgY29tbWFu
-ZCBsaW5lIHN0b3JlZCBpbnNpZGUgdGhlCiMgS0VSTi1BIGJsb2IsIHdoaWNoIHNpdHMgaW4gdGhl
-IHBhcnRpdGlvbiBhcyBwbGFpbiB0ZXh0LiBXaXRoIHZlcmlmaWNhdGlvbiBvbgojIGl0IHNheXMg
-cm9vdD0vZGV2L2RtLTA7IG1ha2VfZGV2X3NzZC5zaCAtLXJlbW92ZV9yb290ZnNfdmVyaWZpY2F0
-aW9uCiMgcmV3cml0ZXMgdGhhdCB0byBwb2ludCBzdHJhaWdodCBhdCB0aGUgcm9vdGZzIHBhcnRp
-dGlvbi4KIwojIFJldHVybnMgMCAodmVyaWZpY2F0aW9uIG9uKSB3aGVuIGl0IGNhbm5vdCB0ZWxs
-LCBiZWNhdXNlIHRoYXQgaXMgdGhlIGFuc3dlcgojIHRoYXQga2VlcHMgUk9PVC1BIHJlYWQtb25s
-eS4KY3Jvc192ZXJpdHlfb24oKSB7ICMgPGRpc2s+CglrZXJuX2E9JChncHRfbnVtX2J5X2xhYmVs
-ICIkMSIgS0VSTi1BKQoJWyAtbiAiJGtlcm5fYSIgXSB8fCByZXR1cm4gMAoJa2Rldj0kKGdwdF9w
-YXJ0X2RldiAiJDEiICIka2Vybl9hIikKCVsgLWIgIiRrZGV2IiBdIHx8IFsgLWYgIiRrZGV2IiBd
-IHx8IHJldHVybiAwCgkjIFJlYWQgdGhlIHBhcnRpdGlvbiBkaXJlY3RseSByYXRoZXIgdGhhbiBw
-aXBpbmcgZGQgaW50byBncmVwOiBncmVwIC1xCgkjIGV4aXRzIG9uIHRoZSBmaXJzdCBtYXRjaCwg
-d2hpY2ggU0lHUElQRXMgZGQsIGFuZCB1bmRlciBgc2V0IC1vIHBpcGVmYWlsYAoJIyB0aGF0IHR1
-cm5zIGEgc3VjY2Vzc2Z1bCBtYXRjaCBpbnRvIGEgZmFpbGVkIHBpcGVsaW5lLgoJZ3JlcCAtYXEg
-J3Jvb3Q9L2Rldi9kbS0nICIka2RldiIgMj4vZGV2L251bGwKfQo=
+aW5zaWRlIHRoZSBHbGFjaWVyIGVudmlyb25tZW50LgojCiMgQ2hyb21lT1MgcGFja3MgdGhyZWUg
+ZmllbGRzIGludG8gdGhlIEdQVCBhdHRyaWJ1dGUgd29yZCBvZiBldmVyeSBrZXJuZWwKIyBwYXJ0
+aXRpb24uIFZlcmlmaWVkIGFnYWluc3QgY2dwdCBvbiBhIHNjcmF0Y2ggZGlzazoKIwojICAgYml0
+cyA0OC01MSAgcHJpb3JpdHkgICAoMC0xNTsgMCBtZWFucyAibmV2ZXIgYm9vdCB0aGlzIikKIyAg
+IGJpdHMgNTItNTUgIHRyaWVzICAgICAgKHJlbWFpbmluZyBib290IGF0dGVtcHRzKQojICAgYml0
+ICA1NiAgICAgc3VjY2Vzc2Z1bCAodGhpcyBrZXJuZWwgYm9vdGVkIGNsZWFubHkgYXQgbGVhc3Qg
+b25jZSkKIwojIFRoZSBmaXJtd2FyZSBib290cyB0aGUga2VybmVsIHBhcnRpdGlvbiB3aXRoIHRo
+ZSBoaWdoZXN0IHByaW9yaXR5IHRoYXQgaGFzCiMgc3VjY2Vzc2Z1bD0xIG9yIHRyaWVzPjAuCiMK
+IyBUd28gdG9vbHMgY2FuIGRvIHRoaXMsIGFuZCBHbGFjaWVyIHVzZXMgd2hpY2hldmVyIGl0IGhh
+czoKIwojICAgY2dwdCAgICBDaHJvbWVPUydzIG93biB0b29sLCBjb3BpZWQgb2ZmIHRoZSBkZXZp
+Y2UgYXQgaW5zdGFsbCB0aW1lIGFsb25nCiMgICAgICAgICAgIHdpdGggaXRzIGdsaWJjIGxvYWRl
+ci4gUHJlZmVycmVkOiBpZGVudGljYWwgc2VtYW50aWNzIHRvIHdoYXQKIyAgICAgICAgICAgQ2hy
+b21lT1MgaXRzZWxmIHVzZXMsIGFuZCBpdCBuZWVkcyBubyBuZXR3b3JrIHRvIG9idGFpbi4KIyAg
+IHNnZGlzayAgZnJvbSBBbHBpbmUncyBncHRmZGlzaywgdXNlZCB3aGVuIGNncHQgd2FzIG5vdCBh
+dmFpbGFibGUuIE5vdGUKIyAgICAgICAgICAgdGhhdCBzZ2Rpc2sncyAiPSIgYXR0cmlidXRlIGFz
+c2lnbm1lbnQgaXMgcmVqZWN0ZWQgYnkgc29tZSBidWlsZHMKIyAgICAgICAgICAgKGdwdGZkaXNr
+IDEuMC4xMCBzYXlzICJDb3VsZCBub3QgY29udmVydCBoZXggYXR0cmlidXRlIG1hc2siKSwgc28K
+IyAgICAgICAgICAgdGhlIGJpdHMgYXJlIHNldCBhbmQgY2xlYXJlZCBvbmUgYXQgYSB0aW1lLgoK
+Q0dQVD0vb3B0L2Nyb3MvYmluL2NncHQKCmdwdF90b29sKCkgewoJaWYgWyAteCAiJENHUFQiIF07
+IHRoZW4KCQlwcmludGYgJ2NncHQnCgllbGlmIGNvbW1hbmQgLXYgc2dkaXNrID4vZGV2L251bGwg
+Mj4mMTsgdGhlbgoJCXByaW50ZiAnc2dkaXNrJwoJZWxzZQoJCXJldHVybiAxCglmaQp9CgojIC0t
+LSBhdHRyaWJ1dGUgd29yZCAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t
+LS0tLS0tLS0tLS0tLS0tLS0tCgpncHRfYXR0cigpIHsgIyA8ZGlzaz4gPHBhcnRudW0+ICAtLSBo
+ZXggc3RyaW5nLCBzZ2Rpc2sgcGF0aCBvbmx5CglzZ2Rpc2sgLS1pbmZvPSIkMiIgIiQxIiAyPi9k
+ZXYvbnVsbCB8CgkJc2VkIC1uICdzL15BdHRyaWJ1dGUgZmxhZ3M6ICpcKFswLTlBLUZhLWZdKlwp
+LiovXDEvcCcKfQoKZ3B0X2ZpZWxkKCkgeyAjIDxkaXNrPiA8cGFydG51bT4gcHJpb3JpdHl8dHJp
+ZXN8c3VjY2Vzc2Z1bAoJY2FzZSAiJChncHRfdG9vbCkiIGluCgkJY2dwdCkKCQkJY2FzZSAiJDMi
+IGluCgkJCQlwcmlvcml0eSkgICAiJENHUFQiIHNob3cgLWkgIiQyIiAtUCAtcSAtbiAiJDEiIDI+
+L2Rldi9udWxsIDs7CgkJCQl0cmllcykgICAgICAiJENHUFQiIHNob3cgLWkgIiQyIiAtVCAtcSAt
+biAiJDEiIDI+L2Rldi9udWxsIDs7CgkJCQlzdWNjZXNzZnVsKSAiJENHUFQiIHNob3cgLWkgIiQy
+IiAtUyAtcSAtbiAiJDEiIDI+L2Rldi9udWxsIDs7CgkJCQkqKSByZXR1cm4gMSA7OwoJCQllc2Fj
+CgkJCTs7CgkJc2dkaXNrKQoJCQlhdHRyPSQoZ3B0X2F0dHIgIiQxIiAiJDIiKQoJCQlbIC1uICIk
+YXR0ciIgXSB8fCByZXR1cm4gMQoJCQl2YWw9JChwcmludGYgJyVkJyAiMHgkYXR0ciIgMj4vZGV2
+L251bGwpIHx8IHJldHVybiAxCgkJCWNhc2UgIiQzIiBpbgoJCQkJcHJpb3JpdHkpICAgcHJpbnRm
+ICclZCcgJCgoICh2YWwgPj4gNDgpICYgMHhGICkpIDs7CgkJCQl0cmllcykgICAgICBwcmludGYg
+JyVkJyAkKCggKHZhbCA+PiA1MikgJiAweEYgKSkgOzsKCQkJCXN1Y2Nlc3NmdWwpIHByaW50ZiAn
+JWQnICQoKCAodmFsID4+IDU2KSAmIDB4MSApKSA7OwoJCQkJKikgcmV0dXJuIDEgOzsKCQkJZXNh
+YwoJCQk7OwoJCSopIHJldHVybiAxIDs7Cgllc2FjCn0KCiMgUmV3cml0ZSBwcmlvcml0eSwgbGVh
+dmluZyB0cmllcyBhbmQgc3VjY2Vzc2Z1bCBhbG9uZS4KZ3B0X3NldF9wcmlvcml0eSgpIHsgIyA8
+ZGlzaz4gPHBhcnRudW0+IDwwLTE1PgoJY2FzZSAiJChncHRfdG9vbCkiIGluCgkJY2dwdCkgIiRD
+R1BUIiBhZGQgLWkgIiQyIiAtUCAiJDMiICIkMSIgPi9kZXYvbnVsbCAyPiYxIDs7CgkJc2dkaXNr
+KQoJCQlfZD0kMQoJCQlfcD0kMgoJCQlfdj0kMwoJCQlfYXJncz0nJwoJCQlfaT0wCgkJCXdoaWxl
+IFsgIiRfaSIgLWx0IDQgXTsgZG8KCQkJCWlmIFsgJCgoIChfdiA+PiBfaSkgJiAxICkpIC1lcSAx
+IF07IHRoZW4KCQkJCQlfYXJncz0iJF9hcmdzIC0tYXR0cmlidXRlcz0kX3A6c2V0OiQoKDQ4ICsg
+X2kpKSIKCQkJCWVsc2UKCQkJCQlfYXJncz0iJF9hcmdzIC0tYXR0cmlidXRlcz0kX3A6Y2xlYXI6
+JCgoNDggKyBfaSkpIgoJCQkJZmkKCQkJCV9pPSQoKF9pICsgMSkpCgkJCWRvbmUKCQkJIyBzaGVs
+bGNoZWNrIGRpc2FibGU9U0MyMDg2CgkJCXNnZGlzayAkX2FyZ3MgIiRfZCIgPi9kZXYvbnVsbCAy
+PiYxCgkJCTs7CgkJKikgcmV0dXJuIDEgOzsKCWVzYWMKfQoKZ3B0X21hcmtfZ29vZCgpIHsgIyA8
+ZGlzaz4gPHBhcnRudW0+IC0tIHN1Y2Nlc3NmdWw9MSwgdHJpZXM9MAoJY2FzZSAiJChncHRfdG9v
+bCkiIGluCgkJY2dwdCkgIiRDR1BUIiBhZGQgLWkgIiQyIiAtUyAxIC1UIDAgIiQxIiA+L2Rldi9u
+dWxsIDI+JjEgOzsKCQlzZ2Rpc2spCgkJCXNnZGlzayAiLS1hdHRyaWJ1dGVzPSQyOnNldDo1NiIg
+XAoJCQkJIi0tYXR0cmlidXRlcz0kMjpjbGVhcjo1MiIgIi0tYXR0cmlidXRlcz0kMjpjbGVhcjo1
+MyIgXAoJCQkJIi0tYXR0cmlidXRlcz0kMjpjbGVhcjo1NCIgIi0tYXR0cmlidXRlcz0kMjpjbGVh
+cjo1NSIgXAoJCQkJIiQxIiA+L2Rldi9udWxsIDI+JjEKCQkJOzsKCQkqKSByZXR1cm4gMSA7OwoJ
+ZXNhYwp9CgojIC0tLSBsb29rdXBzIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0t
+LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCgpncHRfbnVtX2J5X2xhYmVsKCkgeyAjIDxk
+aXNrPiA8bGFiZWw+CgljYXNlICIkKGdwdF90b29sKSIgaW4KCQljZ3B0KSAiJENHUFQiIGZpbmQg
+LW4gLWwgIiQyIiAiJDEiIDI+L2Rldi9udWxsIHwgaGVhZCAtMSA7OwoJCXNnZGlzaykKCQkJc2dk
+aXNrIC1wICIkMSIgMj4vZGV2L251bGwgfCBhd2sgLXYgd2FudD0iJDIiICcKCQkJCS9eWyBdKlsw
+LTldKy8gewoJCQkJCW5hbWUgPSAiIgoJCQkJCWZvciAoaSA9IDc7IGkgPD0gTkY7IGkrKykgbmFt
+ZSA9IG5hbWUgKG5hbWUgPyAiICIgOiAiIikgJGkKCQkJCQlpZiAobmFtZSA9PSB3YW50KSB7IHBy
+aW50ICQxOyBleGl0IH0KCQkJCX0nCgkJCTs7CgkJKikgcmV0dXJuIDEgOzsKCWVzYWMKfQoKZ3B0
+X3BhcnR1dWlkKCkgeyAjIDxkaXNrPiA8cGFydG51bT4KCWNhc2UgIiQoZ3B0X3Rvb2wpIiBpbgoJ
+CWNncHQpICIkQ0dQVCIgc2hvdyAtaSAiJDIiIC11IC1xIC1uICIkMSIgMj4vZGV2L251bGwgOzsK
+CQlzZ2Rpc2spIHNnZGlzayAtLWluZm89IiQyIiAiJDEiIDI+L2Rldi9udWxsIHwKCQkJc2VkIC1u
+ICdzL15QYXJ0aXRpb24gdW5pcXVlIEdVSUQ6ICovL3AnIDs7CgkJKikgcmV0dXJuIDEgOzsKCWVz
+YWMKfQoKIyAvZGV2L3NkYSArIDMgLT4gL2Rldi9zZGEzOyAvZGV2L21tY2JsazAgKyAzIC0+IC9k
+ZXYvbW1jYmxrMHAzLgpncHRfcGFydF9kZXYoKSB7ICMgPGRpc2s+IDxwYXJ0bnVtPgoJY2FzZSAi
+JDEiIGluCgkJKlswLTldKSBwcmludGYgJyVzcCVzJyAiJDEiICIkMiIgOzsKCQkqKSBwcmludGYg
+JyVzJXMnICIkMSIgIiQyIiA7OwoJZXNhYwp9CgojIEZpbmQgdGhlIGludGVybmFsIENocm9tZU9T
+IGRpc2sgYXQgcnVudGltZSByYXRoZXIgdGhhbiB0cnVzdGluZyBhIGRldmljZQojIG5hbWUgcmVj
+b3JkZWQgYXQgaW5zdGFsbCB0aW1lLgpncHRfZmluZF9jcm9zX2Rpc2soKSB7Cglmb3IgZCBpbiAv
+ZGV2L21tY2Jsa1swLTldIC9kZXYvbnZtZVswLTldblswLTldIC9kZXYvc2RbYS16XTsgZG8KCQlb
+IC1iICIkZCIgXSB8fCBjb250aW51ZQoJCWNhc2UgIiRkIiBpbiAqYm9vdFswLTldIHwgKnJwbWIp
+IGNvbnRpbnVlIDs7IGVzYWMKCQlpZiBbIC1uICIkKGdwdF9udW1fYnlfbGFiZWwgIiRkIiBLRVJO
+LUEpIiBdICYmCgkJCVsgLW4gIiQoZ3B0X251bV9ieV9sYWJlbCAiJGQiIFJPT1QtQSkiIF07IHRo
+ZW4KCQkJcHJpbnRmICclcycgIiRkIgoJCQlyZXR1cm4gMAoJCWZpCglkb25lCglyZXR1cm4gMQp9
+CgojIElzIENocm9tZU9TIHN0aWxsIHNldCB1cCB0byB2ZXJpZnkgaXRzIHJvb3QgZmlsZXN5c3Rl
+bT8KIwojIEdsYWNpZXIgY2Fubm90IHJlYWQgL3Byb2MvY21kbGluZSBmb3IgdGhpcyAtLSB0aGF0
+IGlzIEdsYWNpZXIncyBvd24gY29tbWFuZAojIGxpbmUsIG5vdCBDaHJvbWVPUydzLiBUaGUgYXV0
+aG9yaXR5IGlzIHRoZSBjb21tYW5kIGxpbmUgc3RvcmVkIGluc2lkZSB0aGUKIyBLRVJOLUEgYmxv
+Yiwgd2hpY2ggc2l0cyBpbiB0aGUgcGFydGl0aW9uIGFzIHBsYWluIHRleHQuIFdpdGggdmVyaWZp
+Y2F0aW9uIG9uCiMgaXQgc2F5cyByb290PS9kZXYvZG0tMDsgbWFrZV9kZXZfc3NkLnNoIC0tcmVt
+b3ZlX3Jvb3Rmc192ZXJpZmljYXRpb24KIyByZXdyaXRlcyB0aGF0IHRvIHBvaW50IHN0cmFpZ2h0
+IGF0IHRoZSByb290ZnMgcGFydGl0aW9uLgojCiMgUmV0dXJucyAwICh2ZXJpZmljYXRpb24gb24p
+IHdoZW4gaXQgY2Fubm90IHRlbGwsIGJlY2F1c2UgdGhhdCBpcyB0aGUgYW5zd2VyCiMgdGhhdCBr
+ZWVwcyBST09ULUEgcmVhZC1vbmx5Lgpjcm9zX3Zlcml0eV9vbigpIHsgIyA8ZGlzaz4KCWtlcm5f
+YT0kKGdwdF9udW1fYnlfbGFiZWwgIiQxIiBLRVJOLUEpCglbIC1uICIka2Vybl9hIiBdIHx8IHJl
+dHVybiAwCglrZGV2PSQoZ3B0X3BhcnRfZGV2ICIkMSIgIiRrZXJuX2EiKQoJWyAtYiAiJGtkZXYi
+IF0gfHwgWyAtZiAiJGtkZXYiIF0gfHwgcmV0dXJuIDAKCSMgUmVhZCB0aGUgcGFydGl0aW9uIGRp
+cmVjdGx5IHJhdGhlciB0aGFuIHBpcGluZyBkZCBpbnRvIGdyZXA6IGdyZXAgLXEKCSMgZXhpdHMg
+b24gdGhlIGZpcnN0IG1hdGNoLCB3aGljaCBTSUdQSVBFcyBkZCwgYW5kIHVuZGVyIGBzZXQgLW8g
+cGlwZWZhaWxgCgkjIHRoYXQgdHVybnMgYSBzdWNjZXNzZnVsIG1hdGNoIGludG8gYSBmYWlsZWQg
+cGlwZWxpbmUuCglncmVwIC1hcSAncm9vdD0vZGV2L2RtLScgIiRrZGV2IiAyPi9kZXYvbnVsbAp9
+Cg==
 GLACIER_B64
 	chmod 0755 "$d/init" "$d/glacier-menu"
 	printf %s "$d"
@@ -2199,19 +2408,12 @@ glacier_menu() {
 
 main() {
 	local cmd=''
+	# Keep the original list: self_relocate re-execs with it, and by then the
+	# parse loop below has shifted the subcommand off.
+	local -a argv=("$@")
 
-	ui_init
-	require_root_vt
-	require_cmds cgpt blockdev awk sed grep
-
-	# Do this before anything else: once stateful is unmounted, a script
-	# running from it disappears mid-read, because bash reads scripts
-	# incrementally. Re-exec with the ORIGINAL arguments -- doing it after the
-	# parse loop below would hand the new process a list with the subcommand
-	# already shifted off.
-	self_relocate "$@"
-
-	# Global flags may come before or instead of a command.
+	# Parse before any privilege or environment checks, so --help works for
+	# anyone, anywhere.
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			resize | install | uninstall)
@@ -2233,6 +2435,27 @@ main() {
 		esac
 		shift
 	done
+
+	# A --help after the subcommand belongs to the subcommand.
+	case " $* " in
+		*' -h '* | *' --help '*)
+			case "$cmd" in
+				resize) resize_usage ;;
+				install | uninstall) install_usage ;;
+				*) glacier_usage ;;
+			esac
+			exit 0
+			;;
+	esac
+
+	ui_init
+	require_root_vt
+	require_cmds cgpt blockdev awk sed grep
+
+	# Before anything touches the disk: once stateful is unmounted, a script
+	# running from it disappears mid-read, because bash reads scripts
+	# incrementally.
+	self_relocate "${argv[@]}"
 
 	: >"$GLACIER_LOG" 2>/dev/null || :
 	log "glacier $GLACIER_VERSION starting (cmd=${cmd:-menu})"
